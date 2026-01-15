@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import matplotlib.pyplot as plt
 
 # hyperparameters
 batch_size = 32 # how many independent sequences will we process in parallel?
@@ -10,6 +11,11 @@ eval_interval = 300
 learning_rate = 1e-2
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
+logits_preview = True
+logits_preview_interval = 300
+heatmap_preview = True
+heatmap_preview_interval = 600
+heatmap_topk = 20
 # ------------
 
 torch.manual_seed(1337)
@@ -43,7 +49,7 @@ def get_batch(split):
     x, y = x.to(device), y.to(device)
     return x, y
 
-@torch.no_grad()
+@torch.no_grad() # no gradient tracking needed, saves memory and computations
 def estimate_loss():
     out = {}
     model.eval()
@@ -54,7 +60,7 @@ def estimate_loss():
             logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
-    model.train()
+    model.train() # doesn't do anything for bigram, but good practice. In NN, this would re-enable dropout/batchnorm
     return out
 
 # super simple bigram model
@@ -98,7 +104,7 @@ class BigramLanguageModel(nn.Module):
         return idx
 
 model = BigramLanguageModel(vocab_size)
-m = model.to(device)
+m = model.to(device) # move model to GPU if available 
 
 # create a PyTorch optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -114,7 +120,37 @@ for iter in range(max_iters):
     xb, yb = get_batch('train')
 
     # evaluate the loss
+    logits_full = model.token_embedding_table(xb)
     logits, loss = model(xb, yb)
+    if logits_preview and iter % logits_preview_interval == 0:
+        # quick peek at logits distribution for the final time step of a single sample
+        row = logits_full[0, -1].detach().float().cpu()
+        probs = F.softmax(row, dim=-1)
+        print(
+            f"logits preview @ step {iter}: "
+            f"min={row.min():.3f} max={row.max():.3f} mean={row.mean():.3f} std={row.std():.3f}"
+        )
+        # token:prob pairs (vocab order) for a single prediction row
+        pairs = " ".join([f"{itos[i]}:{probs[i]:.3f}" for i in range(vocab_size)])
+        print(f"probs row @ step {iter}: {pairs}")
+    if heatmap_preview and iter % heatmap_preview_interval == 0:
+        # heatmap of top-k probs for the final time step of the first sample
+        row = logits_full[0, -1].detach().float().cpu()
+        probs = F.softmax(row, dim=-1)
+        top_probs, top_idx = torch.topk(probs, k=min(heatmap_topk, vocab_size))
+        top_probs = top_probs.numpy().reshape(1, -1)
+        plt.figure(figsize=(10, 1.8))
+        plt.imshow(top_probs, aspect='auto', cmap='viridis', vmin=0.0, vmax=top_probs.max())
+        plt.yticks([])
+        plt.xticks(
+            range(top_probs.shape[1]),
+            [itos[i] for i in top_idx.tolist()],
+            fontsize=8
+        )
+        plt.colorbar(label='prob')
+        plt.tight_layout()
+        plt.savefig(f'logits_heatmap_step_{iter}.png', dpi=150)
+        plt.close()
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
@@ -123,3 +159,6 @@ for iter in range(max_iters):
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
 # generate 500 tokens, thus the output will be of shape (1, 501) and look like [[token0, token1, token2, ...]]
 print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+
+# bigram model; only looks at the previous token to predict the next token
+# in the transformer, we will look at the entire context of previous tokens to predict the next token

@@ -81,7 +81,7 @@ class Head(nn.Module):
         q = self.query(x) # (B,T,hs)
         # compute attention scores ("affinities")
         wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T), makes it a decoder block, doesn't communicate with future
         wei = F.softmax(wei, dim=-1) # (B, T, T)
         wei = self.dropout(wei)
         # perform the weighted aggregation of the values
@@ -94,22 +94,28 @@ class MultiHeadAttention(nn.Module):
 
     def __init__(self, num_heads, head_size):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(head_size * num_heads, n_embd)
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)]) # create several heads
+        self.proj = nn.Linear(head_size * num_heads, n_embd) # project back to n_embd (residual pathway)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1) # concatenate outputs of all heads
         out = self.dropout(self.proj(out))
         return out
+    # instead of having a single attention head, we have multiple heads that can focus on different parts of the sequence
+    # this allows the model to capture different types of relationships and patterns in the data
+    # ne_embd is split across the different heads
+    # Instead of 1 communication channels of size n_embd, we have num_heads channels of size head_size each (n_embd = num_heads * head_size) 
 
 class FeedFoward(nn.Module):
     """ a simple linear layer followed by a non-linearity """
+    # we use feedforward network to process information after communication after self-attention
+    # this allows the model to learn complex transformations of the data, allow model to think and make decisions based on the aggregated information from self-attention
 
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
+            nn.Linear(n_embd, 4 * n_embd), # expand to 4 times the embedding dimension (for more capacity)
             nn.ReLU(),
             nn.Linear(4 * n_embd, n_embd),
             nn.Dropout(dropout),
@@ -124,15 +130,17 @@ class Block(nn.Module):
     def __init__(self, n_embd, n_head):
         # n_embd: embedding dimension, n_head: the number of heads we'd like
         super().__init__()
-        head_size = n_embd // n_head
+        head_size = n_embd // n_head # size of each head, which is embedding dimension divided by number of heads
         self.sa = MultiHeadAttention(n_head, head_size)
+        # each block has multiple heads of self-attention (communication)
         self.ffwd = FeedFoward(n_embd)
-        self.ln1 = nn.LayerNorm(n_embd)
+        # each block has a feedforward network (computation / thinking once gathered information)
+        self.ln1 = nn.LayerNorm(n_embd) # layer norm before self-attention 
         self.ln2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
+        x = x + self.sa(self.ln1(x)) # residual connection + self-attention + layer norm 
+        x = x + self.ffwd(self.ln2(x)) # residual connection + feedforward + layer norm
         return x
 
 class GPTLanguageModel(nn.Module):
@@ -140,11 +148,12 @@ class GPTLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd) # randomly initialize token embeddings i.e. 32 dim vectors for each token in vocab (B,T,n_embd)
+        self.position_embedding_table = nn.Embedding(block_size, n_embd) # each position in the context gets a (learnable) n_embd dim vector,  learned (initially random) embedding per position, added to the token embedding so the model can encode order.
         self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd) # final layer norm
-        self.lm_head = nn.Linear(n_embd, vocab_size)
+        self.lm_head = nn.Linear(n_embd, vocab_size) # need linear layer to map to go from embedding dimension to vocab size for logits (B,T,vocab_size)
+        # (B,T,n_embd) --lm_head--> (B,T,vocab_size) channel C in BTC gives info
 
         # better init, not covered in the original GPT video, but important, will cover in followup video
         self.apply(self._init_weights)
@@ -163,10 +172,10 @@ class GPTLanguageModel(nn.Module):
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
-        x = tok_emb + pos_emb # (B,T,C)
-        x = self.blocks(x) # (B,T,C)
+        x = tok_emb + pos_emb # (B,T,C) information encoded in both token identity and position
+        x = self.blocks(x) # (B,T,C) 
         x = self.ln_f(x) # (B,T,C)
-        logits = self.lm_head(x) # (B,T,vocab_size)
+        logits = self.lm_head(x) # (B,T,vocab_size), output goes into decoder layer to get logits for each token in vocab
 
         if targets is None:
             loss = None
